@@ -1,17 +1,3 @@
-# Copyright (c) 2016 Uber Technologies, Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from __future__ import absolute_import
 
 from future import standard_library
@@ -59,8 +45,6 @@ class TextCodec(Codec):
     def inject(self, span_context, carrier):
         if not isinstance(carrier, dict):
             raise InvalidCarrierException('carrier not a collection')
-        # Note: we do not url-encode the trace ID because the ':' separator
-        # is not a problem for HTTP header values
         carrier[self.trace_id_header] = span_context_to_string(
             trace_id=span_context.trace_id, span_id=span_context.span_id,
             parent_id=span_context.parent_id, flags=span_context.flags)
@@ -70,10 +54,6 @@ class TextCodec(Codec):
                 encoded_key = key
                 if self.url_encoding:
                     encoded_value = urllib.parse.quote(value)
-                    # we assume that self.url_encoding means we are injecting
-                    # into HTTP headers. httplib does not like unicode strings
-                    # so we convert the key to utf-8. The URL-encoded value is
-                    # already a plain string.
                     if six.PY2 and isinstance(key, six.text_type):
                         encoded_key = key.encode('utf-8')
                 else:
@@ -118,20 +98,46 @@ class TextCodec(Codec):
 
 
 class BinaryCodec(Codec):
-    """
-    BinaryCodec is a no-op.
+    def __init__(self, trace_id_header=TRACE_ID_HEADER):
+        self.trace_id_header = trace_id_header.lower().replace('_', '-')
 
-    """
     def inject(self, span_context, carrier):
         if not isinstance(carrier, bytearray):
             raise InvalidCarrierException('carrier not a bytearray')
-        pass  # TODO binary encoding not implemented
+
+        baggage = span_context.baggage.copy()
+        baggage[self.trace_id_header] = span_context_to_string(
+            trace_id=span_context.trace_id, span_id=span_context.span_id,
+            parent_id=span_context.parent_id, flags=span_context.flags)
+        bin_baggage = bytearray(json.dumps(baggage))
+        carrier.extend(bytearray(struct.pack("I", len(bin_baggage))))
+        carrier.extend(bin_baggage)
 
     def extract(self, carrier):
         if not isinstance(carrier, bytearray):
             raise InvalidCarrierException('carrier not a bytearray')
-        # TODO binary encoding not implemented
-        return None
+
+        ctx_len = struct.unpack('I', carrier[0:4])[0]
+        carrier = json.loads(str(carrier[4:4 + ctx_len]))
+        trace_id, span_id, parent_id, flags = None, None, None, None
+        baggage = None
+        for key, value in six.iteritems(carrier):
+            uc_key = key.lower()
+            if uc_key == self.trace_id_header:
+                trace_id, span_id, parent_id, flags = \
+                    span_context_from_string(value)
+            else:
+                if baggage is None:
+                    baggage = {uc_key: value}
+                else:
+                    baggage[uc_key] = value
+
+        if baggage == None or (not isinstance(baggage, dict)):
+            raise SpanContextCorruptedException()
+
+        return SpanContext(trace_id=trace_id, span_id=span_id,
+                           parent_id=parent_id, flags=flags,
+                           baggage=baggage)
 
 
 def span_context_to_string(trace_id, span_id, parent_id, flags):
